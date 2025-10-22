@@ -1,6 +1,7 @@
 import os
 import subprocess
 
+
 class PatchApplier:
     def __init__(self, working_dir: str):
         self.working_dir = working_dir

@@ -23,7 +23,7 @@ class GitManager:
 
         try:
             self._run_git(["checkout", branch_name])
-            #return control to the caller and once returned it will restore the original branch
+            # return control to the caller and once returned it will restore the original branch
             yield self
         finally:
             if original_branch and original_branch != branch_name:
