@@ -9,6 +9,8 @@ from pathlib import Path
 from ..utils.unit_test_utils import (
     DockerPytestRunner,
     DockerUTPRGitManager,
+    LocalPytestRunner,
+    LocalUTPRGitManager,
     PytestRunner,
     UTPRGitManager,
 )
@@ -19,22 +21,81 @@ UnitTestResultType = Union[Literal["pass", "fail", "skipped", "other"]]
 
 class UnitTestResult:
     """
-    Result of executing unit test suite
+    Result of executing unit test suite.
+
+    Each result is a dict with keys:
+        - nodeid: str (test identifier)
+        - outcome: "passed" | "failed" | "skipped" | "xfailed" | "xpassed" | "error"
+        - when: str (last phase seen, usually "call" or "setup")
+        - duration: float (seconds, sum over phases)
+        - longrepr: str or None (traceback, skip reason, etc.)
     """
 
-    results: List[Tuple[str, UnitTestResultType]]
+    def __init__(self, results: List[Dict[str, Any]]):
+        """
+        Parameters:
+            results: List of test result dictionaries from pytest plugin
+        """
+        self.results = results
 
-    pass
+    def get_pass_count(self) -> int:
+        """Count tests with outcome='passed'"""
+        return sum(1 for r in self.results if r.get("outcome") == "passed")
+
+    def get_fail_count(self) -> int:
+        """Count tests with outcome='failed'"""
+        return sum(1 for r in self.results if r.get("outcome") == "failed")
+
+    def get_total_count(self) -> int:
+        """Count all tests"""
+        return len(self.results)
+
+    def get_pass_rate(self) -> float:
+        """Return percentage of passed tests (0-100)"""
+        total = self.get_total_count()
+        if total == 0:
+            return 0.0
+        return (self.get_pass_count() / total) * 100.0
+
+    def get_passing_test_nodeids(self) -> set:
+        """Return set of nodeids for tests with outcome='passed'"""
+        return {r["nodeid"] for r in self.results if r.get("outcome") == "passed"}
+
+    def get_test_outcome(self, nodeid: str) -> Optional[str]:
+        """Get outcome for a specific test by nodeid"""
+        for r in self.results:
+            if r.get("nodeid") == nodeid:
+                return r.get("outcome")
+        return None
+
+    def filter_by_nodeids(self, nodeid_set: set) -> "UnitTestResult":
+        """Return new UnitTestResult containing only tests matching given nodeids"""
+        filtered_results = [r for r in self.results if r.get("nodeid") in nodeid_set]
+        return UnitTestResult(filtered_results)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for JSON storage"""
+        return {
+            "total_count": self.get_total_count(),
+            "pass_count": self.get_pass_count(),
+            "fail_count": self.get_fail_count(),
+            "pass_rate": self.get_pass_rate(),
+            "results": self.results,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UnitTestResult":
+        """Deserialize from dictionary"""
+        return cls(data.get("results", []))
 
 
 class UnitTestPassRateEvalResult:
     """
-    Result of unit test pass rate evaluation
-    """
+    Result of unit test pass rate evaluation.
 
-    pre_mig_result: UnitTestResult
-    gt_patch_result: UnitTestResult
-    gen_patch_result: UnitTestResult
+    Measures how well patches maintain tests that originally passed on pre-migration branch.
+    The score is NOT about overall pass rate, but specifically about maintaining originally passing tests.
+    """
 
     def __init__(
         self,
@@ -43,12 +104,18 @@ class UnitTestPassRateEvalResult:
         gen_patch_result: UnitTestResult,
         gt_patch_score: float,
         gen_patch_score: float,
+        baseline_passing_test_count: int,
+        gt_maintained_passing_count: int,
+        gen_maintained_passing_count: int,
     ):
         self.pre_mig_result = pre_mig_result
         self.gt_patch_result = gt_patch_result
         self.gen_patch_result = gen_patch_result
         self.gt_patch_score = gt_patch_score
         self.gen_patch_score = gen_patch_score
+        self.baseline_passing_test_count = baseline_passing_test_count
+        self.gt_maintained_passing_count = gt_maintained_passing_count
+        self.gen_maintained_passing_count = gen_maintained_passing_count
 
     @classmethod
     def create_from_results(
@@ -57,8 +124,24 @@ class UnitTestPassRateEvalResult:
         gt_patch_result: UnitTestResult,
         gen_patch_result: UnitTestResult,
     ) -> Self:
-        gt_patch_score = cls._compute_score(pre_mig_result, gt_patch_result)
-        gen_patch_score = cls._compute_score(pre_mig_result, gen_patch_result)
+        """
+        Create evaluation result from three test runs and compute scores.
+
+        Score = (# of originally passing tests that still pass) / (# of originally passing tests)
+
+        This measures test regression, not overall pass rate.
+        """
+        # Get tests that pass on pre-migration (raw) branch - this is our baseline
+        baseline_passing_tests = pre_mig_result.get_passing_test_nodeids()
+        baseline_count = len(baseline_passing_tests)
+
+        # Compute how many of those baseline tests still pass on each post-mig branch
+        gt_patch_score, gt_maintained_count = cls._compute_score(
+            baseline_passing_tests, gt_patch_result
+        )
+        gen_patch_score, gen_maintained_count = cls._compute_score(
+            baseline_passing_tests, gen_patch_result
+        )
 
         return cls(
             pre_mig_result,
@@ -66,21 +149,98 @@ class UnitTestPassRateEvalResult:
             gen_patch_result,
             gt_patch_score,
             gen_patch_score,
+            baseline_count,
+            gt_maintained_count,
+            gen_maintained_count,
         )
 
     @classmethod
     def load_from_json(cls, json_path: Path) -> Self:
-        raise NotImplementedError("")
+        """Load evaluation result from JSON file"""
+        with open(json_path, "r") as f:
+            data = json.load(f)
 
-    def to_dict(self) -> Dict:
-        raise NotImplementedError("")
+        return cls(
+            pre_mig_result=UnitTestResult.from_dict(data["pre_mig_result"]),
+            gt_patch_result=UnitTestResult.from_dict(data["gt_patch_result"]),
+            gen_patch_result=UnitTestResult.from_dict(data["gen_patch_result"]),
+            gt_patch_score=data["gt_patch_score"],
+            gen_patch_score=data["gen_patch_score"],
+            baseline_passing_test_count=data["baseline_passing_test_count"],
+            gt_maintained_passing_count=data["gt_maintained_passing_count"],
+            gen_maintained_passing_count=data["gen_maintained_passing_count"],
+        )
+
+    def get_baseline_passing_tests(self) -> set:
+        """Get set of test nodeids that passed on pre-migration branch"""
+        return self.pre_mig_result.get_passing_test_nodeids()
+
+    def compute_gt_patch_pass_rate(self) -> Tuple[float, int]:
+        """
+        Compute GT patch pass rate from stored results.
+
+        Returns:
+            Tuple of (score, maintained_count)
+            - score: 0-1 normalized score (% of baseline passing tests that still pass)
+            - maintained_count: number of baseline tests that still pass
+        """
+        baseline_passing_tests = self.get_baseline_passing_tests()
+        return self._compute_score(baseline_passing_tests, self.gt_patch_result)
+
+    def compute_gen_patch_pass_rate(self) -> Tuple[float, int]:
+        """
+        Compute generated patch pass rate from stored results.
+
+        Returns:
+            Tuple of (score, maintained_count)
+            - score: 0-1 normalized score (% of baseline passing tests that still pass)
+            - maintained_count: number of baseline tests that still pass
+        """
+        baseline_passing_tests = self.get_baseline_passing_tests()
+        return self._compute_score(baseline_passing_tests, self.gen_patch_result)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dictionary for JSON storage"""
+        return {
+            "pre_mig_result": self.pre_mig_result.to_dict(),
+            "gt_patch_result": self.gt_patch_result.to_dict(),
+            "gen_patch_result": self.gen_patch_result.to_dict(),
+            "gt_patch_score": self.gt_patch_score,
+            "gen_patch_score": self.gen_patch_score,
+            "baseline_passing_test_count": self.baseline_passing_test_count,
+            "gt_maintained_passing_count": self.gt_maintained_passing_count,
+            "gen_maintained_passing_count": self.gen_maintained_passing_count,
+        }
 
     @staticmethod
     def _compute_score(
-        pre_mig_result: UnitTestResult, post_mig_result: UnitTestResult
-    ) -> float:
-        raise NotImplementedError("")
-        return 0.0
+        baseline_passing_tests: set, post_mig_result: UnitTestResult
+    ) -> Tuple[float, int]:
+        """
+        Compute score based on how many originally passing tests still pass.
+
+        Parameters:
+            baseline_passing_tests: Set of nodeids that passed on pre-migration (raw) branch
+            post_mig_result: Test results from post-migration branch
+
+        Returns:
+            Tuple of (score, maintained_count)
+            - score: 0-1 normalized score
+            - maintained_count: number of originally passing tests that still pass
+        """
+        if not baseline_passing_tests:
+            return 0.0, 0
+
+        # Filter to only baseline passing tests
+        filtered_result = post_mig_result.filter_by_nodeids(baseline_passing_tests)
+
+        # Count how many still pass
+        maintained_count = filtered_result.get_pass_count()
+
+        # Compute score: maintained / baseline
+        score = maintained_count / len(baseline_passing_tests)
+
+        return score, maintained_count
 
 
 class UnitTestPassRateEvaluator(AbstractEvaluator):
@@ -107,22 +267,154 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
         self.gt_patch_branch_name = gt_patch_branch_name
         self.gen_patch_branch_name = gen_patch_branch_name
 
+    def _install_editable(self, extras: List[str] = []) -> None:
+        # Only copy if using Docker runner
+        if not isinstance(self.runner, DockerPytestRunner):
+            return
+
+        # eval_tests_path should be on the host (local path)
+        local_tests_path = Path(self.eval_tests_path)
+        if not local_tests_path.exists():
+            raise FileNotFoundError(
+                f"Eval tests path does not exist on host: {local_tests_path}"
+            )
+
+        # Destination: inside the repo folder in the container
+        container_name = self.runner.container_name
+        local_package = str(self.runner.repo_path)
+        if extras:
+            local_package += "["
+            local_package += ",".join(extras)
+            local_package += "]"
+
+        # Copy tests into container's repo folder
+        result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                str(container_name),
+                "/bin/bash",
+                "-c",
+                f"python -m pip install -e {local_package}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to copy tests to container: {result.stderr}")
+
+    def _copy_tests_to_container(self) -> None:
+        """
+        Copy evaluation tests from host into the repo folder in Docker container.
+        Tests will be copied as untracked files that won't interfere with git operations.
+        """
+        # Only copy if using Docker runner
+        if not isinstance(self.runner, DockerPytestRunner):
+            return
+
+        # eval_tests_path should be on the host (local path)
+        local_tests_path = Path(self.eval_tests_path)
+        if not local_tests_path.exists():
+            raise FileNotFoundError(
+                f"Eval tests path does not exist on host: {local_tests_path}"
+            )
+
+        # Destination: inside the repo folder in the container
+        container_name = self.runner.container_name
+        repo_path = self.runner.repo_path
+        dest_path = f"{container_name}:{repo_path}/eval-tests"
+
+        # Copy tests into container's repo folder
+        result = subprocess.run(
+            ["docker", "cp", str(local_tests_path), dest_path],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to copy tests to container: {result.stderr}")
+
+    def _cleanup_tests_from_container(self) -> None:
+        """
+        Remove evaluation tests from the repo folder in Docker container.
+        This cleans up the untracked test files after evaluation is complete.
+        """
+        # Only cleanup if using Docker runner
+        if not isinstance(self.runner, DockerPytestRunner):
+            return
+
+        container_name = self.runner.container_name
+        repo_path = self.runner.repo_path
+        tests_path_in_container = f"{repo_path}/eval-tests"
+
+        # Remove tests from container's repo folder
+        subprocess.run(
+            ["docker", "exec", container_name, "rm", "-rf", tests_path_in_container],
+            capture_output=True,
+            text=True,
+        )
+
     def evaluate(self) -> Dict[str, Any]:
         """
-        Copy repo into a temp folder, and run unit test and get pass rate three times
-        - once on pre-mig branch
-        - once on ground-truth migration branch
-        - once on LLM-generated migration branch
+        Run unit tests on three branches and compute pass rate scores:
+        - Pre-migration branch (baseline)
+        - Ground-truth patch branch
+        - LLM-generated patch branch
+
+        Returns:
+            Dictionary with:
+                - status: "success" or "failed"
+                - eval_result: UnitTestPassRateEvalResult (if successful)
+                - error: Error message (if failed)
+                - partial_results: Available results (if partially failed)
         """
         try:
-            patch_file = self._get_generated_patch_file()
-            if not patch_file:
-                return {"error": "No patch found", "status": "failed"}
+            # Copy tests to container if using Docker
+            self._install_editable()
+            self._copy_tests_to_container()
 
-            pre_mig_result = self._evaluate_for_branch(self.pre_mig_branch_name)
-            gt_patch_result = self._evaluate_for_branch(self.gt_patch_branch_name)
-            gen_patch_result = self._evaluate_for_branch(self.gen_patch_branch_name)
+            # Validate eval tests path exists
+            eval_tests_path = Path(self.eval_tests_path)
+            if not eval_tests_path.exists():
+                return {
+                    "error": f"Eval tests path does not exist: {self.eval_tests_path}",
+                    "status": "failed",
+                }
 
+            pre_mig_result = None
+            gt_patch_result = None
+            gen_patch_result = None
+            errors = []
+
+            # Evaluate pre-migration branch (required baseline)
+            try:
+                pre_mig_result = self._evaluate_for_branch(self.pre_mig_branch_name)
+            except Exception as e:
+                return {
+                    "error": f"Failed to evaluate pre-migration branch '{self.pre_mig_branch_name}': {str(e)}",
+                    "status": "failed",
+                }
+
+            # Evaluate ground-truth patch branch
+            try:
+                gt_patch_result = self._evaluate_for_branch(self.gt_patch_branch_name)
+            except Exception as e:
+                return {
+                    "error": f"Failed to evaluate GT patch branch '{self.gt_patch_branch_name}': {str(e)}",
+                    "status": "failed",
+                }
+
+            # Evaluate generated patch branch
+            try:
+                gen_patch_result = self._evaluate_for_branch(self.gen_patch_branch_name)
+            except Exception as e:
+                return {
+                    "error": f"Failed to evaluate generated patch branch '{self.gen_patch_branch_name}': {str(e)}",
+                    "status": "failed",
+                }
+
+            # Create evaluation result
             eval_result = UnitTestPassRateEvalResult.create_from_results(
                 pre_mig_result=pre_mig_result,
                 gt_patch_result=gt_patch_result,
@@ -130,38 +422,78 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
             )
 
             self._save_results(eval_result)
-            return {"eval_result": eval_result, "status": "success"}
+
+            return {
+                "eval_result": eval_result,
+                "status": "success",
+            }
 
         except Exception as e:
-            return {"error": str(e), "status": "failed"}
+            return {
+                "error": f"Failed to compute evaluation results: {str(e)}",
+                "status": "failed",
+            }
+        finally:
+            # Always cleanup tests from container
+            self._cleanup_tests_from_container()
 
     def _get_generated_patch_file(self) -> Optional[str]:
+        """Find the most recent generated patch file in trajectory directory"""
         try:
             trajectory_dir = Path(self.config.trajectory_path)
             if not trajectory_dir.exists():
                 return None
 
-            self._evaluate_for_branch(sel)
+            # Find all patch files
+            patch_files = list(trajectory_dir.rglob("*.patch"))
+            if patch_files:
+                # Return the most recent patch file
+                latest_patch = max(patch_files, key=lambda p: p.stat().st_mtime)
+                return str(latest_patch)
 
+            return None
         except Exception as e:
             return None
 
     def _evaluate_for_branch(self, branch_name: str) -> UnitTestResult:
         """
-        Compute unit test pass rate on a branch. This includes
-        - copy eval test to branch
-        - run eval test
+        Run unit tests on a specific branch and return results.
+
+        Parameters:
+            branch_name: Name of the branch to evaluate
+
+        Returns:
+            UnitTestResult containing test outcomes
+
+        Raises:
+            RuntimeError: If branch doesn't exist or tests fail to run
         """
-        raise NotImplementedError("")
-        return UnitTestResult()
+        # Checkout the branch using context manager (automatically restores original branch)
+        with self.utpr_git_manager.branch_context(branch_name):
+            # Determine test path based on runner type
+            if isinstance(self.runner, DockerPytestRunner):
+                # For Docker, tests are copied to {repo_path}/eval-tests in container
+                test_path = Path(self.runner.repo_path) / "eval-tests"
+            else:
+                # For local, use the configured eval_tests_path
+                test_path = Path(self.eval_tests_path)
+
+            # Run pytest on the eval tests
+            test_results = self.runner.run_pytest(test_path=test_path, args=[])
+
+            # Create and return UnitTestResult object
+            return UnitTestResult(test_results)
 
     def _save_results(self, result: UnitTestPassRateEvalResult) -> None:
+        """Save evaluation results to JSON file"""
         try:
             os.makedirs(self.config.score_path, exist_ok=True)
-            score_file = os.path.join(self.config.score_path, "patch_similarity.json")
+            score_file = os.path.join(
+                self.config.score_path, "unit_test_pass_rate.json"
+            )
 
             results = {
-                "evaluator": "PatchSimilarityEvaluator",
+                "evaluator": "UnitTestPassRateEvaluator",
                 "pass_rate_result": result.to_dict(),
             }
 
@@ -175,13 +507,29 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
 
 
 if __name__ == "__main__":
+    # Example 1: Local execution
+    local_pytest_runner = LocalPytestRunner(repo_path=Path("/path/to/repo"))
+    local_utpr_git_manager = LocalUTPRGitManager(repo_path=Path("/path/to/repo"))
+
+    local_utpr_eval = UnitTestPassRateEvaluator(
+        {},
+        "main",
+        "gt-patch",
+        "gen-patch",
+        local_pytest_runner,
+        local_utpr_git_manager,
+    )
+    result = local_utpr_eval.evaluate()
+
+    # Example 2: Docker execution
     docker_pytest_runner = DockerPytestRunner(
         "<repo-container-name>", Path("/ws/<repo-folder-name>")
     )
     docker_utpr_git_manager = DockerUTPRGitManager(
         "<repo-container-name>", Path("/ws/<repo-folder-name>")
     )
-    utpr_eval = UnitTestPassRateEvaluator(
+
+    docker_utpr_eval = UnitTestPassRateEvaluator(
         {},
         "main",
         "gt-patch",
@@ -189,4 +537,4 @@ if __name__ == "__main__":
         docker_pytest_runner,
         docker_utpr_git_manager,
     )
-    result = utpr_eval.evaluate()
+    result = docker_utpr_eval.evaluate()
