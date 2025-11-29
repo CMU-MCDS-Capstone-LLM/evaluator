@@ -421,7 +421,6 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
                 - error: Error message (if failed)
         """
         try:
-            # breakpoint()
             # Validate eval tests path exists on host
             eval_tests_path = Path(self.eval_tests_path)
             if not eval_tests_path.exists():
@@ -522,7 +521,6 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
             RuntimeError: If branch doesn't exist or tests fail to run
         """
         # Checkout the branch using context manager (automatically restores original branch)
-        breakpoint()
         with self.utpr_git_manager.branch_context(branch_name):
             try:
                 # Copy tests to container/repo before running
@@ -537,7 +535,9 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
                     test_path = Path(self.eval_tests_path)
 
                 # Run pytest on the eval tests
-                test_results = self.runner.run_pytest(test_path=test_path, args=[])
+                test_results = self.runner.run_pytest(
+                    test_path=test_path, args=["--continue-on-collection-errors"]
+                )
 
                 # Create and return UnitTestResult object
                 return UnitTestResult(test_results)
