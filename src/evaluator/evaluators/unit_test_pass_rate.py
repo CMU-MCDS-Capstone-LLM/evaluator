@@ -252,12 +252,16 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
         gen_patch_branch_name: str,
         runner: PytestRunner,
         utpr_git_manager: UTPRGitManager,
+        gen_patch_file: Path,
     ):
         """
         Parameters:
         pre_mig_branch_name (str): Branch name of the repo before migration
         gt_patch_branch_name (str): Branch name of the repo with ground-truth patch applied
-        gen_patch_branch_name (str): Branch name of the repo with llm-generated patch applied
+        gen_patch_branch_name (str): Branch name for the generated patch (will be created from patch file)
+        runner (PytestRunner): Pytest runner (local or Docker)
+        utpr_git_manager (UTPRGitManager): Git manager
+        gen_patch_file (Path): Path to patch file on host for creating gen-patch branch (required)
         """
         self.config = config
         self.eval_tests_path = config.eval_tests_path
@@ -266,6 +270,25 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
         self.pre_mig_branch_name = pre_mig_branch_name
         self.gt_patch_branch_name = gt_patch_branch_name
         self.gen_patch_branch_name = gen_patch_branch_name
+        self.gen_patch_file = Path(gen_patch_file)
+
+    def _setup_git_info(self) -> None:
+        self.utpr_git_manager._run_git(
+            [
+                "config",
+                "--global",
+                "user.name",
+                "code-migration-pipeline",
+            ]
+        )
+        self.utpr_git_manager._run_git(
+            [
+                "config",
+                "--global",
+                "user.email",
+                "pipeline.local",
+            ]
+        )
 
     def _install_editable(self, extras: List[str] = []) -> None:
         # Only copy if using Docker runner
@@ -302,7 +325,9 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"Failed to copy tests to container: {result.stderr}")
+            raise RuntimeError(
+                f"Failed to install package as editable w/ argument {extras}: {result.stderr}"
+            )
 
     def _copy_tests_to_container(self) -> None:
         """
@@ -355,26 +380,49 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
             text=True,
         )
 
+    def _create_gen_patch_branch(self) -> None:
+        """Create gen-patch branch from patch file on host"""
+        if not self.gen_patch_file.exists():
+            raise FileNotFoundError(
+                f"Generated patch file not found: {self.gen_patch_file}"
+            )
+
+        # Read patch content from host
+        with open(self.gen_patch_file, "r") as f:
+            patch_content = f.read()
+
+        # Create branch from patch using git manager
+        # This works for both local and Docker (DockerUTPRGitManager handles container operations)
+        self.utpr_git_manager.create_branch_from_patch(
+            old_branch_name=self.pre_mig_branch_name,
+            new_branch_name=self.gen_patch_branch_name,
+            patch_content=patch_content,
+        )
+
+    def _delete_gen_patch_branch(self) -> None:
+        """Delete gen-patch branch after evaluation"""
+        try:
+            self.utpr_git_manager.delete_branch(self.gen_patch_branch_name)
+        except Exception:
+            # Ignore errors during cleanup
+            pass
+
     def evaluate(self) -> Dict[str, Any]:
         """
         Run unit tests on three branches and compute pass rate scores:
         - Pre-migration branch (baseline)
         - Ground-truth patch branch
-        - LLM-generated patch branch
+        - LLM-generated patch branch (created from patch file)
 
         Returns:
             Dictionary with:
                 - status: "success" or "failed"
                 - eval_result: UnitTestPassRateEvalResult (if successful)
                 - error: Error message (if failed)
-                - partial_results: Available results (if partially failed)
         """
         try:
-            # Copy tests to container if using Docker
-            self._install_editable()
-            self._copy_tests_to_container()
-
-            # Validate eval tests path exists
+            # breakpoint()
+            # Validate eval tests path exists on host
             eval_tests_path = Path(self.eval_tests_path)
             if not eval_tests_path.exists():
                 return {
@@ -382,12 +430,17 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
                     "status": "failed",
                 }
 
+            # Create gen-patch branch from patch file
+            self._setup_git_info()
+            self._install_editable()
+            self._create_gen_patch_branch()
+
             pre_mig_result = None
             gt_patch_result = None
             gen_patch_result = None
-            errors = []
 
             # Evaluate pre-migration branch (required baseline)
+            # Tests are copied/cleaned up inside _evaluate_for_branch
             try:
                 pre_mig_result = self._evaluate_for_branch(self.pre_mig_branch_name)
             except Exception as e:
@@ -421,8 +474,6 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
                 gen_patch_result=gen_patch_result,
             )
 
-            self._save_results(eval_result)
-
             return {
                 "eval_result": eval_result,
                 "status": "success",
@@ -434,8 +485,9 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
                 "status": "failed",
             }
         finally:
-            # Always cleanup tests from container
-            self._cleanup_tests_from_container()
+            # Always cleanup: delete gen-patch branch
+            # breakpoint()
+            self._delete_gen_patch_branch()
 
     def _get_generated_patch_file(self) -> Optional[str]:
         """Find the most recent generated patch file in trajectory directory"""
@@ -458,6 +510,7 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
     def _evaluate_for_branch(self, branch_name: str) -> UnitTestResult:
         """
         Run unit tests on a specific branch and return results.
+        Tests are copied before evaluation and cleaned up after.
 
         Parameters:
             branch_name: Name of the branch to evaluate
@@ -469,22 +522,31 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
             RuntimeError: If branch doesn't exist or tests fail to run
         """
         # Checkout the branch using context manager (automatically restores original branch)
+        breakpoint()
         with self.utpr_git_manager.branch_context(branch_name):
-            # Determine test path based on runner type
-            if isinstance(self.runner, DockerPytestRunner):
-                # For Docker, tests are copied to {repo_path}/eval-tests in container
-                test_path = Path(self.runner.repo_path) / "eval-tests"
-            else:
-                # For local, use the configured eval_tests_path
-                test_path = Path(self.eval_tests_path)
+            try:
+                # Copy tests to container/repo before running
+                self._copy_tests_to_container()
 
-            # Run pytest on the eval tests
-            test_results = self.runner.run_pytest(test_path=test_path, args=[])
+                # Determine test path based on runner type
+                if isinstance(self.runner, DockerPytestRunner):
+                    # For Docker, tests are copied to {repo_path}/eval-tests in container
+                    test_path = Path(self.runner.repo_path)
+                else:
+                    # For local, use the configured eval_tests_path
+                    test_path = Path(self.eval_tests_path)
 
-            # Create and return UnitTestResult object
-            return UnitTestResult(test_results)
+                # Run pytest on the eval tests
+                test_results = self.runner.run_pytest(test_path=test_path, args=[])
 
-    def _save_results(self, result: UnitTestPassRateEvalResult) -> None:
+                # Create and return UnitTestResult object
+                return UnitTestResult(test_results)
+
+            finally:
+                # Always cleanup tests after evaluation
+                self._cleanup_tests_from_container()
+
+    def save_results(self, result: UnitTestPassRateEvalResult) -> None:
         """Save evaluation results to JSON file"""
         try:
             os.makedirs(self.config.score_path, exist_ok=True)
@@ -502,7 +564,7 @@ class UnitTestPassRateEvaluator(AbstractEvaluator):
         except Exception as e:
             pass
 
-    def _load_results(self, result_path: Path) -> UnitTestPassRateEvalResult:
+    def load_results(self, result_path: Path) -> UnitTestPassRateEvalResult:
         return UnitTestPassRateEvalResult.load_from_json(result_path)
 
 

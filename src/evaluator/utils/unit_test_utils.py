@@ -115,6 +115,7 @@ class LocalPytestRunner(PytestRunner):
         Parameters:
             repo_path: Root path of repository (for changing directory before running tests)
         """
+        raise NotImplementedError("Local pytest runner not implemented!")
         self.repo_path = repo_path
 
     @override
@@ -179,6 +180,7 @@ class DockerPytestRunner(PytestRunner):
         Returns:
             List of test result dictionaries
         """
+        # breakpoint()
         if args is None:
             args = []
 
@@ -407,6 +409,7 @@ class LocalUTPRGitManager(UTPRGitManager):
         Parameters:
             repo_path: Path to git repository
         """
+        raise NotImplementedError("Local pytest runner not implemented!")
         self.repo_path = repo_path
 
     @override
@@ -513,11 +516,16 @@ class DockerUTPRGitManager(UTPRGitManager):
         )
         bash_script = f"cd {self.repo_path} && {git_command}"
 
-        return subprocess.run(
+        result = subprocess.run(
             ["docker", "exec", self.container_name, "/bin/bash", "-c", bash_script],
             capture_output=True,
             text=True,
         )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to run git with command {command}: {result}")
+
+        return result
 
     @override
     def create_branch_from_patch(
@@ -573,22 +581,11 @@ class DockerUTPRGitManager(UTPRGitManager):
             )
 
             if result.returncode != 0:
-                # Try with --reject if 3-way merge fails
-                apply_script = (
-                    f"cd {self.repo_path} && git apply --reject {temp_patch_path}"
-                )
-                result = subprocess.run(
-                    [
-                        "docker",
-                        "exec",
-                        self.container_name,
-                        "/bin/bash",
-                        "-c",
-                        apply_script,
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
+                raise RuntimeError(f"Failed to apply generated patch: {result}")
+
+            self._run_git(["add", "-A"])
+            self._run_git(["commit", "-m", "Apply LLM-generated patch"])
+            self._run_git(["checkout", old_branch_name])
 
             return result.returncode == 0
 
